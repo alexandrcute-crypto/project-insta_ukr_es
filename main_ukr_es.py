@@ -1,4 +1,4 @@
-import argparse, json, os, math, tempfile, random
+import argparse, json, os, math, subprocess, tempfile, random
 import numpy as np
 from moviepy import (
     ImageClip, AudioFileClip, CompositeAudioClip,
@@ -6,12 +6,24 @@ from moviepy import (
 )
 from moviepy.video.io.VideoFileClip import VideoFileClip
 from PIL import Image, ImageDraw, ImageFont
-from edge_tts_helper import tts_edge   # наш помічник TTS
+from edge_tts_helper import tts_edge   # твій помічник TTS (edge-tts)
 
 # ---------- TTS wrapper ----------
 def tts_edge_multi(text, lang_code, out_path):
     # lang_code: 'uk' | 'es' | ...
     tts_edge(text, lang_code, out_path)
+
+# ---------- ffmpeg helpers (гучність/швидкість для іспанської озвучки) ----------
+def ffmpeg_tempo_volume(in_path, out_path, tempo=1.0, volume=1.0):
+    """
+    Змінює швидкість (tempo) та гучність (volume) аудіо через ffmpeg.
+    tempo  <1.0 → повільніше; >1.0 → швидше. Діапазон atempo: 0.5..2.0
+    volume >1.0 → голосніше;  <1.0 → тихіше.
+    """
+    # приклад фільтра: atempo=0.95,volume=1.05
+    filt = f"atempo={tempo},volume={volume}"
+    cmd = ["ffmpeg", "-y", "-i", in_path, "-vn", "-af", filt, out_path]
+    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 # ---------- fonts ----------
 def get_font(font_size: int):
@@ -29,7 +41,7 @@ def get_font(font_size: int):
                 pass
     return ImageFont.load_default()
 
-# ---------- helpers ----------
+# ---------- utils ----------
 def load_json(path):
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
@@ -39,10 +51,10 @@ def hex_to_rgb(hx):
     return (int(hx[0:2], 16), int(hx[2:4], 16), int(hx[4:6], 16))
 
 def rgba_image_to_clip(img_rgba, position, duration):
-    """PIL RGBA -> (RGB clip + mask) коректно для прозорості"""
+    """PIL RGBA -> (RGB clip + маска прозорості), сумісно з MoviePy v2.x."""
     arr = np.array(img_rgba)
     if arr.ndim == 3 and arr.shape[2] == 4:
-        rgb = arr[:, :, :3]
+        rgb   = arr[:, :, :3]
         alpha = (arr[:, :, 3].astype(float) / 255.0)
         base = ImageClip(rgb).with_position(position).with_duration(duration)
         mask = ImageClip(alpha).with_position(position).with_duration(duration).with_mask()
@@ -75,7 +87,6 @@ def ring_image(w, h, frac, center, radius, thickness, color_rgb, bg_opacity=0.3)
     draw = ImageDraw.Draw(img)
     cx, cy = center
     bbox = [cx-radius, cy-radius, cx+radius, cy+radius]
-    # легке кільце-фон
     draw.ellipse(bbox, outline=(255,255,255,int(255*bg_opacity)), width=thickness)
     if frac > 0:
         end = 360*frac
@@ -83,20 +94,8 @@ def ring_image(w, h, frac, center, radius, thickness, color_rgb, bg_opacity=0.3)
         draw.arc(bbox, start=-90, end=-90+end, width=thickness, fill=(r,g,b,255))
     return img
 
-def digit_image(w, h, text, center_y, font_size, color_hex):
-    img = Image.new("RGBA", (w,h), (0,0,0,0))
-    draw = ImageDraw.Draw(img)
-    font = get_font(font_size)
-    r,g,b = hex_to_rgb(color_hex); fill = (r,g,b,255)
-    bbox = draw.textbbox((0, 0), text, font=font)
-    w_px, h_px = bbox[2] - bbox[0], bbox[3] - bbox[1]
-    x = (w - w_px)//2
-    y = int(center_y - h_px*0.5)
-    draw.text((x,y), text, font=font, fill=fill)
-    return img
-
-def make_timer_clip(W,H,dur,center,radius,thickness,accent_rgb,bg_opacity, number_center_y, font_size, text_color, show_numbers=False):
-    # кільце
+def make_timer_clip(W,H,dur,center,radius,thickness,accent_rgb,bg_opacity):
+    # тільки кільце без цифр
     def ring_frame(t):
         frac = min(1.0, max(0.0, t/dur))
         img = ring_image(W,H,frac,center,radius,thickness,accent_rgb,bg_opacity)
@@ -108,24 +107,7 @@ def make_timer_clip(W,H,dur,center,radius,thickness,accent_rgb,bg_opacity, numbe
 
     ring_clip = VideoClip(ring_frame).with_duration(dur)
     ring_mask_clip = VideoClip(ring_mask).with_duration(dur)
-    ring_clip = ring_clip.with_mask(ring_mask_clip)
-
-    if show_numbers:
-        def num_frame(t):
-            n = max(0, int(math.ceil(dur - t)))
-            img = digit_image(W,H,f"{n}", number_center_y, font_size, text_color)
-            return np.array(img)[:, :, :3]
-        def num_mask(t):
-            n = max(0, int(math.ceil(dur - t)))
-            img = digit_image(W,H,f"{n}", number_center_y, font_size, text_color)
-            return np.array(img)[:, :, 3].astype(float)/255.0
-
-        num_clip = VideoClip(num_frame).with_duration(dur)
-        num_mask_clip = VideoClip(num_mask).with_duration(dur)
-        num_clip = num_clip.with_mask(num_mask_clip)
-        return CompositeVideoClip([ring_clip, num_clip]).with_duration(dur)
-
-    return ring_clip
+    return ring_clip.with_mask(ring_mask_clip)
 
 def load_avatar_clip(C, W, H, duration):
     avatar_path = C["avatar"]
@@ -144,33 +126,30 @@ def load_avatar_clip(C, W, H, duration):
 
 # ---------- main ----------
 def main():
+    # базові константи для синхронізації
+    MIN_DUR = 0.6          # анти-нуль
+    q_lead_pause = 0.35    # пауза після "Як буде іспанською" (перед 1-ю парою)
+    post_pair_gap = 1.0    # пауза між повними парами
+    pre_block_pause = 1.2  # пауза перед/після підбадьорення
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="config_ukr_es.json")
-    ap.add_argument("--dict",   default="inputs_ukr_es/words.json", help="JSON: [{'uk'|'ukr':'...','es':'...'}, ...] або {uk: es, ...}")
+    ap.add_argument("--dict",   default="inputs_ukr_es/words.json")
     ap.add_argument("--out",    default="outputs/lesson_ukr_es.mp4")
     ap.add_argument("--stage_seconds", type=float, default=4.0, help="таймер (сек)")
-    ap.add_argument("--pause_mid", type=float, default=1.2, help="пауза до/після підбадьорення між блоками")
-    ap.add_argument("--end_tail", type=float, default=0.5, help="фінальна затримка після фінального спічу (сек)")
-    ap.add_argument("--tts_q_lang", default="uk", help="мова питання (укр)")
+    ap.add_argument("--tts_q_lang", default="uk", help="мова питання та укр-слова")
     ap.add_argument("--tts_a_lang", default="es", help="мова відповіді (ісп)")
-    ap.add_argument("--timer_show_numbers", action="store_true", help="показувати цифри у таймері")
-    # вступ і підбадьорення
-    ap.add_argument("--intro_phrase", default="Ну що ж, час іспанської!", help="фраза на старті")
+    ap.add_argument("--intro_phrase", default="Ну що ж, час іспанської!")
     ap.add_argument("--intro_lang",   default="uk")
-    ap.add_argument("--mid_praise",   default="", help="JSON-файл зі списком підбадьорень після 5-ї; якщо пусто — вбудовані")
-    ap.add_argument("--final_praise", default="", help="JSON-файл зі списком фінальних підбадьорень; якщо пусто — вбудовані")
-    # звукові ефекти (опційно)
-    ap.add_argument("--tick_audio", default="", help="луп тикань (wav/mp3)")
-    ap.add_argument("--tick_vol", type=float, default=0.12)
-    ap.add_argument("--count", type=int, default=10, help="Скільки пар брати на урок")
-    ap.add_argument("--seed", type=int, default=None, help="Сид для відтворюваного рандому (необов'язково)")
-    args = ap.parse_args()
+    ap.add_argument("--count", type=int, default=10, help="скільки пар брати (очікуємо 10 для 2×5)")
+    ap.add_argument("--seed", type=int, default=None)
+    # налаштування для іспанської озвучки
+    ap.add_argument("--es_tempo", type=float, default=0.95, help="швидкість (atempo) іспанської, 0.95=на 5% повільніше")
+    ap.add_argument("--es_gain",  type=float, default=1.05, help="гучність іспанської, 1.05=+5%")
+    # цільова тривалість (паддинг)
+    ap.add_argument("--target_len", type=float, default=0.0, help="якщо >0, допадити ролик до цієї тривалості (сек)")
 
-    # константи
-    MIN_DUR = 0.6        # мінімальна тривалість кроку
-    q_lead_pause = 0.35  # пауза після "Як буде іспанською" (разово перед 1-ю парою)
-    post_pair_gap = 1.0  # пауза між повними парами
-    pre_block_pause = args.pause_mid
+    args = ap.parse_args()
 
     if args.seed is not None:
         random.seed(args.seed)
@@ -195,10 +174,8 @@ def main():
     timer_center = (W//2, int(H*C["timer_top_y"]))
     timer_radius = C["timer_radius"]; timer_thickness = C["timer_thickness"]
     timer_bg_opacity = C["timer_bg_opacity"]
-    number_center_y = int(H*C["timer_top_y"] - C["timer_radius"]*0.15)
-    num_font_size = C["timer_font_size"]
 
-    # словник uk/ukr → es
+    # словник uk→es
     raw = load_json(args.dict)
     pairs = []
     if isinstance(raw, dict):
@@ -206,54 +183,47 @@ def main():
             pairs.append({"uk": str(uk), "es": str(es)})
     elif isinstance(raw, list):
         for it in raw:
-            if not isinstance(it, dict): 
-                continue
-            uk_val = it.get("uk", it.get("ukr", None))
-            es_val = it.get("es", None)
-            if uk_val is not None and es_val is not None:
-                pairs.append({"uk": str(uk_val), "es": str(es_val)})
-
+            if isinstance(it, dict) and "ukr" in it and "es" in it:
+                # підтримка ключа "ukr" з твоїх файлів
+                pairs.append({"uk": str(it["ukr"]), "es": str(it["es"])})
+            elif isinstance(it, dict) and "uk" in it and "es" in it:
+                pairs.append({"uk": str(it["uk"]), "es": str(it["es"])})
+    random.shuffle(pairs)
     if len(pairs) < args.count:
         raise ValueError(f"У словнику {len(pairs)} пар, потрібно щонайменше {args.count}")
-
-    random.shuffle(pairs)
     lesson = pairs[:args.count]
 
-    # блоки 2×5
-    blocks = [lesson[i:i+5] for i in range(0, len(lesson), 5)]
-    blocks = blocks[:2]
-    print(">>> lesson len:", len(lesson))
-    print(">>> blocks sizes:", [len(b) for b in blocks])
+    # рівно 2×5
+    blocks = [lesson[i:i+5] for i in range(0, len(lesson), 5)][:2]
 
-    # підбадьорення
-    mid_list = load_json(args.mid_praise) if args.mid_praise else [
-        "Непогано!", "Це хороший результат.", "Так тримати!", "Бачу, ти наполегливо йдеш до мети.", "Іспанська не така складна!"
+    # підбадьорення за замовчуванням
+    mid_list = [
+        "Непогано!", "Це хороший результат.", "Так тримати!",
+        "Бачу, ти наполегливо йдеш до мети.", "Іспанська не така складна!"
     ]
-    fin_list = load_json(args.final_praise) if args.final_praise else [
-        "Чудовий урок!", "Так тримати!", "Тобі вдалось дійти до фінішу.", "Такими кроками ми швидко все вивчимо.", "Заходь частіше!"
+    fin_list = [
+        "Чудовий урок!", "Так тримати!", "Тобі вдалось дійти до фінішу.",
+        "Такими кроками ми швидко все вивчимо.", "Заходь частіше!"
     ]
 
-    # таймлайн
     clips = []
     audio_tracks = []
     t_cursor = 0.0
     tmpdir = tempfile.mkdtemp(prefix="tts_uk_es_")
 
-    # === INTRO ===
-    # короткий візуал старту (аватар на 1.5с)
-    intro_vis = 1.5
+    # ВСТУП: показ аватара під час озвучки + пауза після
+    # (1) тиша з аватаром перед стартом (красиво з'являється)
+    pre_intro = 0.6
     clips.append(CompositeVideoClip([
-        bg_base.with_duration(intro_vis),
-        load_avatar_clip(C, W, H, intro_vis)
-    ]).with_duration(intro_vis))
-    t_cursor += intro_vis
+        bg_base.with_duration(pre_intro),
+        load_avatar_clip(C, W, H, pre_intro)
+    ]).with_duration(pre_intro))
+    t_cursor += pre_intro
 
-    # озвучка вступу + показ на його тривалість
+    # (2) озвучка вступу
     intro_mp3 = os.path.join(tmpdir, "intro.mp3")
-    intro_text = getattr(args, "intro_phrase", "Ну що ж, час іспанської!")
-    intro_lang = getattr(args, "intro_lang", "uk")
     try:
-        tts_edge_multi(intro_text, intro_lang, intro_mp3)
+        tts_edge_multi(args.intro_phrase, args.intro_lang, intro_mp3)
         intro_clip = AudioFileClip(intro_mp3).with_start(t_cursor)
         intro_dur = max(MIN_DUR, intro_clip.duration or 1.2)
         audio_tracks.append(intro_clip)
@@ -267,16 +237,15 @@ def main():
     ]).with_duration(intro_dur))
     t_cursor += intro_dur
 
-    # збільшена пауза після вступу
-    pause_after_intro = 1.8
+    # (3) пауза після вступу (щоб не злипалось із «Як буде…»)
+    post_intro_pause = 1.2
     clips.append(CompositeVideoClip([
-        bg_base.with_duration(pause_after_intro),
-        load_avatar_clip(C, W, H, pause_after_intro)
-    ]).with_duration(pause_after_intro))
-    t_cursor += pause_after_intro
-    # === /INTRO ===
+        bg_base.with_duration(post_intro_pause),
+        load_avatar_clip(C, W, H, post_intro_pause)
+    ]).with_duration(post_intro_pause))
+    t_cursor += post_intro_pause
 
-    # допоміжний рендер блоків (рівно 5 рядків)
+    # підготовка відмалювання
     def render_block_layer(duration, left_lines, right_lines):
         n_rows = 5
         left_img  = make_column_image_fixed_rows(left_lines,  n_rows, font_size, col_w, text_color)
@@ -286,20 +255,19 @@ def main():
         avatar_clip = load_avatar_clip(C, W, H, duration)
         return [bg_base.with_duration(duration), avatar_clip, left_clip, right_clip]
 
-    # робота з двома блоками по 5
-    left_accum, right_accum = [], []
     stage = args.stage_seconds
+
+    left_accum, right_accum = [], []
 
     for bi, block_pairs in enumerate(blocks):
         if len(block_pairs) < 5:
-            print(f">>> skip short block {bi} (len={len(block_pairs)})")
             continue
 
         for i, pr in enumerate(block_pairs):
             uk = pr["uk"].strip()
             es = pr["es"].strip()
 
-            # 1) ЛИШЕ ОДИН РАЗ перед першою парою уроку: “Як буде іспанською”
+            # Разова фраза "Як буде іспанською" перед першою парою всього уроку
             if bi == 0 and i == 0:
                 q_path = os.path.join(tmpdir, f"q_b{bi}_i{i}.mp3")
                 try:
@@ -321,10 +289,10 @@ def main():
                 ).with_duration(q_lead_pause))
                 t_cursor += q_lead_pause
 
-            # 2) УКРАЇНСЬКЕ слово (озвучка + показ зліва)
+            # УКРАЇНСЬКЕ слово: озвучити + показати зліва
             uk_path = os.path.join(tmpdir, f"uk_b{bi}_i{i}.mp3")
             try:
-                tts_edge_multi(uk, args.tts_q_lang, uk_path)  # укр. голос
+                tts_edge_multi(uk, args.tts_q_lang, uk_path)
                 uk_clip = AudioFileClip(uk_path).with_start(t_cursor)
                 uk_dur  = max(MIN_DUR, uk_clip.duration or 0.0)
                 audio_tracks.append(uk_clip)
@@ -338,23 +306,21 @@ def main():
             ).with_duration(uk_dur))
             t_cursor += uk_dur
 
-            # 3) Таймер (кільце без цифр)
-            ring = make_timer_clip(
-                W, H, stage, timer_center, timer_radius, timer_thickness,
-                accent_rgb, timer_bg_opacity, number_center_y, num_font_size, text_color,
-                show_numbers=False
-            )
+            # ТАЙМЕР 4с (або args.stage_seconds)
+            ring = make_timer_clip(W,H,stage, timer_center,timer_radius,timer_thickness,accent_rgb,timer_bg_opacity)
             clips.append(CompositeVideoClip(
                 render_block_layer(stage, left_accum, right_accum) + [ring]
             ).with_duration(stage))
             t_cursor += stage
 
-            # 4) ІСПАНСЬКЕ слово (озвучка + показ справа)
-            a_path = os.path.join(tmpdir, f"a_b{bi}_i{i}.mp3")
+            # ВІДПОВІДЬ (іспанське слово): сповільнити та підсилити через ffmpeg
+            a_in  = os.path.join(tmpdir, f"a_in_b{bi}_i{i}.mp3")
+            a_out = os.path.join(tmpdir, f"a_out_b{bi}_i{i}.mp3")
             try:
-                tts_edge_multi(es, args.tts_a_lang, a_path)
-                a_clip = AudioFileClip(a_path).with_start(t_cursor)
-                a_dur  = max(MIN_DUR, a_clip.duration or 0.0)
+                tts_edge_multi(es, args.tts_a_lang, a_in)
+                ffmpeg_tempo_volume(a_in, a_out, tempo=args.es_tempo, volume=args.es_gain)
+                a_clip = AudioFileClip(a_out).with_start(t_cursor)
+                a_dur = max(MIN_DUR, a_clip.duration or 0.0)
                 audio_tracks.append(a_clip)
             except Exception as e:
                 print("A TTS error:", e)
@@ -366,51 +332,48 @@ def main():
             ).with_duration(a_dur))
             t_cursor += a_dur
 
-            # 5) Пауза між парами (1.0с)
+            # пауза між парами
             clips.append(CompositeVideoClip(
                 render_block_layer(post_pair_gap, left_accum, right_accum)
             ).with_duration(post_pair_gap))
             t_cursor += post_pair_gap
 
-        # --- кінець блоку з 5 пар ---
+        # Після першого блоку: пауза + підбадьорення + очистка
         if bi == 0:
-            # пауза
             clips.append(CompositeVideoClip(
                 render_block_layer(pre_block_pause, left_accum, right_accum)
             ).with_duration(pre_block_pause))
             t_cursor += pre_block_pause
 
-            # рандомна мотиваційна озвучка
-            praise = random.choice(mid_list)
+            mid_phrase = random.choice(mid_list)
             p_path = os.path.join(tmpdir, "mid_praise.mp3")
             try:
-                tts_edge_multi(praise, args.tts_q_lang, p_path)
+                tts_edge_multi(mid_phrase, args.tts_q_lang, p_path)
                 p_clip = AudioFileClip(p_path).with_start(t_cursor)
-                p_dur  = max(MIN_DUR, p_clip.duration or 0.0)
+                p_dur = max(MIN_DUR, p_clip.duration or 0.0)
                 audio_tracks.append(p_clip)
             except Exception as e:
-                print("Mid praise TTS error:", e)
-                p_dur = MIN_DUR
+                print("Mid praise TTS error:", e); p_dur = MIN_DUR
 
             clips.append(CompositeVideoClip(
                 render_block_layer(p_dur, left_accum, right_accum)
             ).with_duration(p_dur))
             t_cursor += p_dur
 
-            # пауза і очищення перед другим блоком
             clips.append(CompositeVideoClip(
                 render_block_layer(pre_block_pause, left_accum, right_accum)
             ).with_duration(pre_block_pause))
             t_cursor += pre_block_pause
 
+            # Очистити екран і стеки перед другим блоком
             left_accum, right_accum = [], []
-            clear_dur = 0.2
+            clear_dur = 0.25
             clips.append(CompositeVideoClip(
                 render_block_layer(clear_dur, left_accum, right_accum)
             ).with_duration(clear_dur))
             t_cursor += clear_dur
 
-    # фінальна пауза + фінальне підбадьорення
+    # Фінал: пауза + фінальна фраза + хвостик
     clips.append(CompositeVideoClip(
         render_block_layer(pre_block_pause, left_accum, right_accum)
     ).with_duration(pre_block_pause))
@@ -421,47 +384,40 @@ def main():
     try:
         tts_edge_multi(final_phrase, args.tts_q_lang, f_path)
         f_clip = AudioFileClip(f_path).with_start(t_cursor)
-        f_dur  = max(MIN_DUR, f_clip.duration or 0.0)
+        f_dur = max(MIN_DUR, f_clip.duration or 0.0)
         audio_tracks.append(f_clip)
     except Exception as e:
-        print("Final praise TTS error:", e)
-        f_dur = MIN_DUR
+        print("Final praise TTS error:", e); f_dur = MIN_DUR
 
     clips.append(CompositeVideoClip(
         render_block_layer(f_dur, left_accum, right_accum)
     ).with_duration(f_dur))
     t_cursor += f_dur
 
-    # хвостик
-    end_tail = args.end_tail
-    if end_tail > 0:
-        clips.append(CompositeVideoClip(
-            render_block_layer(end_tail, left_accum, right_accum)
-        ).with_duration(end_tail))
-        t_cursor += end_tail
+    end_tail = 0.5
+    clips.append(CompositeVideoClip(
+        render_block_layer(end_tail, left_accum, right_accum)
+    ).with_duration(end_tail))
+    t_cursor += end_tail
 
-    # аудіо-трек тикань (опц.) на весь ролик
-    final_tracks = list(audio_tracks)
+    # Збірка відео + аудіо
     video = concatenate_videoclips(clips, method="compose")
-    if args.tick_audio:
-        try:
-            tick = AudioFileClip(args.tick_audio).volumex(args.tick_vol)
-            pos = 0.0
-            ticks = []
-            while pos < video.duration:
-                ticks.append(tick.with_start(pos))
-                pos += max(0.1, tick.duration)
-            final_tracks.extend(ticks)
-        except Exception as e:
-            print("Tick audio error:", e)
-
-    if final_tracks:
-        final_audio = CompositeAudioClip(final_tracks).with_duration(video.duration)
+    if audio_tracks:
+        final_audio = CompositeAudioClip(audio_tracks).with_duration(video.duration)
         video = video.with_audio(final_audio)
 
+    # Якщо задано target_len — допадити до цієї тривалості (не масштабуємо, а додаємо фінальний статичний кадр)
+    if args.target_len and args.target_len > 0:
+        cur = video.duration or 0.0
+        if cur < args.target_len:
+            pad = args.target_len - cur
+            pad_layer = CompositeVideoClip(render_block_layer(pad, left_accum, right_accum)).with_duration(pad)
+            video = concatenate_videoclips([video, pad_layer], method="compose")
+
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
+    print(">>> Building video:", args.out)
     video.write_videofile(args.out, fps=FPS, codec="libx264", audio_codec="aac", preset="medium", threads=4)
 
 if __name__ == "__main__":
-    print(">>> UKR->ES single-block flow, 2x5 pairs, Q->timer->A with praises")
+    print(">>> UKR->ES flow, 2x5 pairs, strict sequencing, ES audio tempo+gain via ffmpeg")
     main()
